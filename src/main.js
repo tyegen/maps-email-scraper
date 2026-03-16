@@ -3,9 +3,15 @@ import { PlaywrightCrawler, Dataset, createPlaywrightRouter, log as crawleeLog }
 
 await Actor.init();
 
-const { searchQueries, maxResultsPerQuery = 10, maxWebsitePages = 5 } = await Actor.getInput();
+const { 
+    searchQueries, 
+    maxResultsPerQuery = 10, 
+    maxWebsitePages = 2,
+    maxConcurrency = 5 
+} = await Actor.getInput();
 
 const router = createPlaywrightRouter();
+const requestQueue = await Actor.openRequestQueue();
 
 router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
     crawleeLog.info(`Searching Google Maps for: ${request.userData.query}`);
@@ -62,13 +68,18 @@ router.addHandler('BUSINESS_DETAIL', async ({ page, request, enqueueLinks }) => 
 
     crawleeLog.info(`Business: ${name}, Website: ${website || 'N/A'}`);
 
-    if (website && !['google.com', 'gstatic.com', 'facebook.com', 'instagram.com'].some(d => website.includes(d))) {
-        await enqueueLinks({
-            urls: [website],
+    if (website && !['google.com', 'gstatic.com', 'facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com'].some(d => website.includes(d))) {
+        crawleeLog.info(`Enqueuing website for email extraction: ${website}`);
+        // Use requestQueue directly for more reliability in handler transitions
+        await requestQueue.addRequest({
+            url: website,
             label: 'EXTRACT_EMAILS',
-            userData: { businessName: name, website, pagesCrawled: 0 }
+            userData: { businessName: name, website: website, pagesCrawled: 0 },
+            // Unique key to prevent duplicate processing of the same website
+            uniqueKey: website.replace('www.', '').split(/[?#]/)[0]
         });
     } else {
+        crawleeLog.info(`Skipping website for ${name}: ${website || 'None'}`);
         await Dataset.pushData({ businessName: name, website, emails: [], status: website ? 'skipped domain' : 'no website' });
     }
 });
@@ -111,7 +122,22 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, enqueueLinks }) => {
 
 const crawler = new PlaywrightCrawler({
     requestHandler: router,
-    maxRequestsPerCrawl: 100,
+    maxConcurrency,
+    // Increase timeout for Istanbul's large results if needed
+    requestHandlerTimeoutSecs: 60,
+    launchContext: {
+        launchOptions: {
+            headless: true,
+        },
+    },
+    // Speed up by blocking non-essential assets
+    preNavigationHooks: [
+        async ({ blockRequests }) => {
+            await blockRequests({
+                urlPatterns: ['.jpg', '.jpeg', '.png', '.svg', '.gif', '.css', '.woff', '.pdf', '.zip'],
+            });
+        },
+    ],
 });
 
 crawleeLog.info('Starting crawler...');

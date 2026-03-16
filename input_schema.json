@@ -21,6 +21,13 @@
             "title": "Max Website Pages to Crawl",
             "type": "integer",
             "description": "Maximum number of pages to crawl on each business website to find emails.",
+            "default": 2,
+            "minimum": 1
+        },
+        "maxConcurrency": {
+            "title": "Max Concurrency",
+            "type": "integer",
+            "description": "Maximum number of parallel browser tabs.",
             "default": 5,
             "minimum": 1
         }
