@@ -11,4 +11,4 @@ COPY . ./
 RUN npm install --include=dev --audit=false
 
 # Specify the command to run the Actor
-CMD ./node_modules/.bin/apify start --no-update-notifier
+CMD npm start
