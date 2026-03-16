@@ -310,8 +310,7 @@ for (const [name, data] of resultsMap.entries()) {
         address: data.address || null,
         phoneUnformatted: data.phone || null,
         totalScore: data.totalScore || null,
-        reviewsCount: data.reviewsCount || null,
-        location: data.location || null
+        reviewsCount: data.reviewsCount || null
     };
 
     if (extractContacts) {
@@ -328,11 +327,11 @@ for (const [name, data] of resultsMap.entries()) {
 
     finalResults.push(finalData);
 
-    // Prepare Map Markers
-    if (finalData.location && finalData.location.lat && finalData.location.lng) {
+    // Prepare Map Markers (we still need location here for the map, but it won't be pushed to Dataset)
+    if (data.location && data.location.lat && data.location.lng) {
         mapMarkers.push({
-            lat: finalData.location.lat,
-            lng: finalData.location.lng,
+            lat: data.location.lat,
+            lng: data.location.lng,
             title: finalData.title,
             score: finalData.totalScore
         });
@@ -378,7 +377,8 @@ if (mapMarkers.length > 0) {
     </body>
     </html>
     `;
-    await Actor.setValue('results-map', mapHtml, { contentType: 'text/html' });
+    // Save as OUTPUT so Apify renders it directly in the Live View tab
+    await Actor.setValue('OUTPUT', mapHtml, { contentType: 'text/html' });
 }
 
 log.info(`Done. Pushed ${finalResults.length} businesses.`);
