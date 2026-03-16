@@ -1,0 +1,29 @@
+{
+    "title": "Google Maps Email Scraper",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchQueries": {
+            "title": "Search Queries",
+            "type": "array",
+            "description": "List of search queries to run on Google Maps (e.g. ['dentists in Calgary', 'plumbers in London'])",
+            "prefill": ["dentists in Calgary"],
+            "editor": "stringList"
+        },
+        "maxResultsPerQuery": {
+            "title": "Max Results Per Query",
+            "type": "integer",
+            "description": "Maximum number of business results to process for each query.",
+            "default": 10,
+            "minimum": 1
+        },
+        "maxWebsitePages": {
+            "title": "Max Website Pages to Crawl",
+            "type": "integer",
+            "description": "Maximum number of pages to crawl on each business website to find emails.",
+            "default": 5,
+            "minimum": 1
+        }
+    },
+    "required": ["searchQueries"]
+}
