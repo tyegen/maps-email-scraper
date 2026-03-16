@@ -6,15 +6,14 @@ await Actor.init();
 const { 
     searchQueries, 
     maxResultsPerQuery = 10, 
-    maxWebsitePages = 2,
+    maxWebsitePages = 2, // Keep it low for speed
     maxConcurrency = 10 
 } = await Actor.getInput();
 
 const router = createPlaywrightRouter();
 const requestQueue = await Actor.openRequestQueue();
 
-// Aggregation map to store results per business
-// Format: businessName -> { website, emails: Set, status }
+// Track processed businesses to avoid duplicate entries in final dataset
 const resultsMap = new Map();
 
 function cleanWebsiteUrl(url) {
@@ -71,53 +70,69 @@ router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
     }
 });
 
-router.addHandler('BUSINESS_DETAIL', async ({ page, request }) => {
+router.addHandler('BUSINESS_DETAIL', async ({ page, request, log }) => {
+    // No long wait here, just wait for H1
+    await page.waitForSelector('h1', { timeout: 10000 }).catch(() => {});
     const name = await page.$eval('h1', el => el.innerText.trim()).catch(() => 'Unknown');
+    
     let website = await page.evaluate(() => {
         const el = document.querySelector('a[data-item-id="authority"]') 
                 || document.querySelector('a[aria-label*="website"]')
                 || document.querySelector('a[aria-label*="Web sitesi"]')
                 || document.querySelector('a[aria-label*="web sitesi"]')
-                || Array.from(document.querySelectorAll('a')).find(a => a.href && !a.href.includes('google.com') && a.innerText.toLowerCase().includes('website'));
+                || Array.from(document.querySelectorAll('a')).find(a => a.href && !a.href.includes('google.com') && (a.innerText.toLowerCase().includes('site') || a.innerText.toLowerCase().includes('web')));
         return el ? el.href : null;
     });
 
     website = cleanWebsiteUrl(website);
-    log.info(`Business: ${name}`);
+    log.info(`Business Found: ${name}`);
 
-    // Initialize in map
-    resultsMap.set(name, { website, emails: new Set(), status: 'processing' });
+    // Standardize name for Map key to avoid casing duplicates
+    const mapKey = name.toLowerCase().trim();
+    if (!resultsMap.has(mapKey)) {
+        resultsMap.set(mapKey, { businessName: name, website, emails: new Set(), status: 'processing' });
+    } else {
+        log.info(`Business ${name} already in results, skipping.`);
+        return;
+    }
 
-    if (website && !['facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com'].some(d => website.includes(d))) {
+    if (website && !['facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com', 'tiktok.com'].some(d => website.includes(d))) {
         await requestQueue.addRequest({
             url: website,
             label: 'EXTRACT_EMAILS',
             userData: { businessName: name, website, pagesCrawled: 0 },
         });
     } else {
-        resultsMap.get(name).status = website ? 'skipped domain' : 'no website';
+        resultsMap.get(mapKey).status = website ? 'skipped (social/google)' : 'no website';
     }
 });
 
-router.addHandler('EXTRACT_EMAILS', async ({ page, request, enqueueLinks }) => {
+router.addHandler('EXTRACT_EMAILS', async ({ page, request, log, enqueueLinks }) => {
     const { businessName, website, pagesCrawled } = request.userData;
+    const mapKey = businessName.toLowerCase().trim();
+    const res = resultsMap.get(mapKey);
+
+    // If we already have emails and want to be FAST, we could stop here. 
+    // But let's at least finish the current page.
     
     const html = await page.content();
     const mailto = await page.$$eval('a[href^="mailto:"]', (els) => els.map(el => el.href.replace('mailto:', '').split('?')[0].trim()));
-    const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@(?![0-9.])[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+    const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
     
-    const res = resultsMap.get(businessName);
     if (res) {
         [...mailto, ...pageEmails].forEach(e => {
             const clean = e.toLowerCase().trim();
-            if (clean.includes('@') && !clean.match(/\.(png|jpg|jpeg|gif|svg|webp|woff|ttf|css|js)$/)) {
+            // Filter out common junk and duplicates handled by Set
+            if (clean.includes('@') && clean.includes('.') && !clean.match(/\.(png|jpg|jpeg|gif|svg|webp|woff|ttf|css|js|ico)$/)) {
                 res.emails.add(clean);
             }
         });
     }
 
-    // Crawl subpages if emails not found enough or just search for more
-    if (pagesCrawled < maxWebsitePages) {
+    // Speed optimization: If emails found on homepage, DON'T crawl subpages unless depth is forced
+    const foundAny = res && res.emails.size > 0;
+    
+    if (!foundAny && pagesCrawled < maxWebsitePages) {
         await enqueueLinks({
             limit: 3,
             selector: 'a',
@@ -128,7 +143,10 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, enqueueLinks }) => {
                     const u = new URL(req.url);
                     const b = new URL(website);
                     if (u.hostname.replace('www.', '') !== b.hostname.replace('www.', '')) return false;
-                    if (/\.(pdf|zip|jpg|png|jpeg|docx?|xlsx?|woff2?|ttf|svg|css|js)$/i.test(u.pathname)) return false;
+                    // Aggressive filter
+                    if (/\.(pdf|zip|jpg|png|jpeg|docx?|xlsx?|woff2?|ttf|svg|css|js|mp4|mp3|wav)$/i.test(u.pathname)) return false;
+                    // Ignore login/cart/etc.
+                    if (['login', 'cart', 'checkout', 'account', 'register'].some(w => u.pathname.toLowerCase().includes(w))) return false;
                     return req;
                 } catch(e) {}
                 return false;
@@ -136,21 +154,35 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, enqueueLinks }) => {
         });
     }
     
-    if (res && res.emails.size > 0) res.status = 'success';
-    else if (res && res.status === 'processing') res.status = 'searching...';
+    if (res) {
+        if (res.emails.size > 0) res.status = 'success';
+        else if (res.status === 'processing') res.status = 'no emails found';
+    }
 });
 
 const crawler = new PlaywrightCrawler({
     requestHandler: router,
     maxConcurrency,
-    requestHandlerTimeoutSecs: 60,
+    // Lower timeouts for speed
+    requestHandlerTimeoutSecs: 45,
+    navigationTimeoutSecs: 30,
     launchContext: {
         launchOptions: {
             headless: true,
-            args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--disable-features=IsolateOrigins,site-per-process'],
+            args: [
+                '--disable-dev-shm-usage', 
+                '--no-sandbox', 
+                '--disable-gpu', 
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--blink-settings=imagesEnabled=false', // Hard block images in browser engine
+            ],
         },
     },
-    browserPoolOptions: { useFingerprints: true },
+    browserPoolOptions: { 
+        useFingerprints: true,
+        // Kill browsers faster to free CPU
+        operationTimeoutSecs: 30,
+    },
     preNavigationHooks: [
         async ({ blockRequests }) => {
             await blockRequests({
