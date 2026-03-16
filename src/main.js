@@ -69,7 +69,42 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                 }
             }
             
-            return { mapsUrl, businessName, website };
+            // Extract Rating & Reviews
+            let totalScore = null;
+            let reviewsCount = null;
+            const scoreEl = article.querySelector('span[role="img"][aria-label*="star"], span[role="img"][aria-label*="yıldız"]');
+            if (scoreEl) {
+                const aria = scoreEl.getAttribute('aria-label');
+                const match = aria.match(/[\d,.]+/g);
+                if (match && match.length >= 2) {
+                    totalScore = parseFloat(match[0].replace(',', '.'));
+                    reviewsCount = parseInt(match[1].replace(/\D/g, ''), 10);
+                }
+            }
+
+            // Extract Address from feed text
+            let address = null;
+            const textDivs = article.querySelectorAll('div > div');
+            for (const div of textDivs) {
+                const text = div.innerText || '';
+                if (text.length > 10 && (text.includes('·') || text.match(/\d+/))) {
+                    // Very rudimentary way to catch address/category line in Google Maps feed
+                    if (!text.includes('Yorum') && !text.includes('Review')) {
+                        const parts = text.split('·');
+                        address = parts[parts.length - 1].trim();
+                    }
+                }
+            }
+
+            // Extract Coordinates from URL
+            let location = { lat: null, lng: null };
+            const coordsMatch = mapsUrl.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+            if (coordsMatch) {
+                location.lat = parseFloat(coordsMatch[1]);
+                location.lng = parseFloat(coordsMatch[2]);
+            }
+
+            return { mapsUrl, businessName, website, totalScore, reviewsCount, address, location };
         }).filter(item => item !== null);
     });
 
@@ -93,6 +128,10 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                 businessName: item.businessName, 
                 mapsUrl: item.mapsUrl,
                 website: cleanWebsiteUrl(item.website), 
+                totalScore: item.totalScore,
+                reviewsCount: item.reviewsCount,
+                address: item.address,
+                location: item.location,
                 emails: new Set(),
                 socials: {},
                 status: 'feed_extracted' 
@@ -260,6 +299,8 @@ if (extractContacts || extractSocialMedia) {
 
 log.info('Finalizing results...');
 const finalResults = [];
+const mapMarkers = [];
+
 for (const [name, data] of resultsMap.entries()) {
     const finalData = {
         title: data.businessName,
@@ -270,6 +311,7 @@ for (const [name, data] of resultsMap.entries()) {
         phoneUnformatted: data.phone || null,
         totalScore: data.totalScore || null,
         reviewsCount: data.reviewsCount || null,
+        location: data.location || null
     };
 
     if (extractContacts) {
@@ -277,7 +319,6 @@ for (const [name, data] of resultsMap.entries()) {
     }
     
     if (extractSocialMedia) {
-        // Convert Sets in socials to arrays
         const socialsArrays = {};
         for (const [plat, links] of Object.entries(data.socials)) {
             socialsArrays[`${plat}s`] = [...links];
@@ -286,8 +327,60 @@ for (const [name, data] of resultsMap.entries()) {
     }
 
     finalResults.push(finalData);
+
+    // Prepare Map Markers
+    if (finalData.location && finalData.location.lat && finalData.location.lng) {
+        mapMarkers.push({
+            lat: finalData.location.lat,
+            lng: finalData.location.lng,
+            title: finalData.title,
+            score: finalData.totalScore
+        });
+    }
 }
 await Dataset.pushData(finalResults);
+
+// Generate Live Map HTML
+if (mapMarkers.length > 0) {
+    log.info('Generating results-map.html...');
+    const mapHtml = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Google Maps Scraper - Live View</title>
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <style>#map { height: 100vh; width: 100%; margin: 0; padding: 0; }</style>
+    </head>
+    <body style="margin:0;">
+        <div id="map"></div>
+        <script>
+            const markers = ${JSON.stringify(mapMarkers)};
+            const map = L.map('map');
+            let bounds = new L.LatLngBounds();
+            
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap'
+            }).addTo(map);
+
+            markers.forEach(m => {
+                const marker = L.marker([m.lat, m.lng]).addTo(map);
+                marker.bindPopup('<b>' + m.title + '</b><br>Rating: ' + (m.score || 'N/A'));
+                bounds.extend([m.lat, m.lng]);
+            });
+
+            if (markers.length > 0) {
+                map.fitBounds(bounds, { padding: [50, 50] });
+            } else {
+                map.setView([0, 0], 2);
+            }
+        </script>
+    </body>
+    </html>
+    `;
+    await Actor.setValue('results-map', mapHtml, { contentType: 'text/html' });
+}
+
 log.info(`Done. Pushed ${finalResults.length} businesses.`);
 
 await Actor.exit();
