@@ -57,13 +57,14 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
             if (!linkEl) return null;
             
             const mapsUrl = linkEl.href;
-            const businessName = linkEl.getAttribute('aria-label') || 'Unknown';
+            const businessName = article.getAttribute('aria-label') || linkEl.getAttribute('aria-label') || 'Unknown';
             
             // Try to find website button in the feed card
             let website = null;
             const webEls = article.querySelectorAll('a');
             for (const a of webEls) {
-                if (a.href && !a.href.includes('google.com') && !a.href.includes('/maps/') && (a.innerText.toLowerCase().includes('site') || a.innerText.toLowerCase().includes('web') || a.getAttribute('data-value')?.toLowerCase().includes('web'))) {
+                // If the link goes somewhere else than Google Maps, it's the website
+                if (a.href && !a.href.includes('google.com') && !a.href.includes('/maps/')) {
                     website = a.href;
                     break;
                 }
@@ -87,11 +88,13 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
             const textDivs = article.querySelectorAll('div > div');
             for (const div of textDivs) {
                 const text = div.innerText || '';
-                if (text.length > 10 && (text.includes('·') || text.match(/\d+/))) {
-                    // Very rudimentary way to catch address/category line in Google Maps feed
-                    if (!text.includes('Yorum') && !text.includes('Review')) {
-                        const parts = text.split('·');
-                        address = parts[parts.length - 1].trim();
+                if (text.includes('·')) {
+                    const parts = text.split('·').map(p => p.trim());
+                    for (const p of parts) {
+                        // If it's long enough, doesn't look like just a phone number, and isn't a price/review text
+                        if (p.length > 5 && !p.match(/^\+?[\d\s\-\(\)]+$/) && !p.includes('$') && !p.toLowerCase().includes('review') && !p.toLowerCase().includes('yorum')) {
+                            address = p;
+                        }
                     }
                 }
             }
@@ -157,14 +160,23 @@ playwrightRouter.addHandler('BUSINESS_DETAIL', async ({ page, request, log }) =>
     const details = await page.evaluate(() => {
         const d = { 
             category: null, address: null, phone: null, 
-            totalScore: null, reviewsCount: null, price: null 
+            totalScore: null, reviewsCount: null, price: null,
+            city: null, country: null
         };
         
         const catEl = document.querySelector('button[jsaction*="category"]');
         if (catEl) d.category = catEl.innerText.trim();
         
         const addrEl = document.querySelector('button[data-item-id="address"]');
-        if (addrEl) d.address = addrEl.innerText.trim();
+        if (addrEl) {
+            const rawAddress = addrEl.innerText.trim();
+            d.address = rawAddress;
+            const parts = rawAddress.split(',').map(s => s.trim());
+            if (parts.length >= 3) {
+                d.country = parts[parts.length - 1]; // Assume last part is country
+                d.city = parts[parts.length - 2].split(' ')[0]; // Basic split for city
+            }
+        }
         
         const phoneEl = document.querySelector('button[data-item-id^="phone:"]');
         if (phoneEl) d.phone = phoneEl.innerText.trim();
@@ -302,15 +314,16 @@ const finalResults = [];
 const mapMarkers = [];
 
 for (const [name, data] of resultsMap.entries()) {
+    // Map to exactly what the user requested
     const finalData = {
-        title: data.businessName,
-        mapsUrl: data.mapsUrl,
-        website: data.website,
-        categoryName: data.category || null,
-        address: data.address || null,
-        phoneUnformatted: data.phone || null,
-        totalScore: data.totalScore || null,
-        reviewsCount: data.reviewsCount || null
+        "place name": data.businessName,
+        "total score": data.totalScore || null,
+        "reviews count": data.reviewsCount || null,
+        "street": data.address || null, // Best effort from feed or deep extract
+        "city": data.city || null,
+        "country": data.country || null,
+        "website": data.website,
+        "tel no": data.phone || null
     };
 
     if (extractContacts) {
@@ -377,8 +390,8 @@ if (mapMarkers.length > 0) {
     </body>
     </html>
     `;
-    // Save as OUTPUT so Apify renders it directly in the Live View tab
-    await Actor.setValue('OUTPUT', mapHtml, { contentType: 'text/html' });
+    // Save as key-value store item that user can preview
+    await Actor.setValue('results-map.html', mapHtml, { contentType: 'text/html' });
 }
 
 log.info(`Done. Pushed ${finalResults.length} businesses.`);
