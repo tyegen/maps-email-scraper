@@ -6,12 +6,27 @@ await Actor.init();
 const { 
     searchQueries, 
     maxResultsPerQuery = 10, 
-    maxWebsitePages = 2,
-    maxConcurrency = 2 // Lowered default to prevent OOM on 1GB
+    maxWebsitePages = 3,
+    maxConcurrency = 5 
 } = await Actor.getInput();
 
 const router = createPlaywrightRouter();
 const requestQueue = await Actor.openRequestQueue();
+
+// Helper to clean Google redirect URLs
+function cleanWebsiteUrl(url) {
+    if (!url) return null;
+    try {
+        const u = new URL(url);
+        if (u.hostname.includes('google.com') && u.pathname.includes('/url')) {
+            const q = u.searchParams.get('q');
+            return q ? q : url;
+        }
+    } catch (e) {
+        // ignore
+    }
+    return url;
+}
 
 router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
     crawleeLog.info(`Searching Google Maps for: ${request.userData.query}`);
@@ -25,18 +40,27 @@ router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
 
     await page.waitForSelector('div[role="feed"]', { timeout: 30000 }).catch(() => crawleeLog.error('Feed not found'));
     
-    // Scroll
+    // More aggressive scroll
     await page.evaluate(async (max) => {
         const feed = document.querySelector('div[role="feed"]');
         if (!feed) return;
-        let lastHeight = feed.scrollHeight;
-        let articles = document.querySelectorAll('div[role="article"]').length;
-        while (articles < max) {
+        
+        let lastCount = 0;
+        let stagnated = 0;
+        
+        while (stagnated < 10) {
+            const currentCount = document.querySelectorAll('div[role="article"]').length;
+            if (currentCount >= max) break;
+            
+            if (currentCount === lastCount) {
+                stagnated++;
+            } else {
+                stagnated = 0;
+            }
+            
+            lastCount = currentCount;
             feed.scrollBy(0, 1000);
-            await new Promise(r => setTimeout(r, 2000));
-            articles = document.querySelectorAll('div[role="article"]').length;
-            if (feed.scrollHeight === lastHeight) break;
-            lastHeight = feed.scrollHeight;
+            await new Promise(r => setTimeout(r, 1500));
         }
     }, maxResultsPerQuery);
 
@@ -45,7 +69,7 @@ router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
     });
 
     const uniqueLinks = [...new Set(links)].slice(0, maxResultsPerQuery);
-    crawleeLog.info(`Found ${uniqueLinks.length} businesses to process.`);
+    crawleeLog.info(`Found ${uniqueLinks.length} businesses.`);
 
     for (const url of uniqueLinks) {
         await enqueueLinks({
@@ -56,12 +80,12 @@ router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
     }
 });
 
-router.addHandler('BUSINESS_DETAIL', async ({ page, request, enqueueLinks }) => {
-    crawleeLog.info(`Processing business detail: ${request.url}`);
-    await page.waitForTimeout(3000);
+router.addHandler('BUSINESS_DETAIL', async ({ page, request, log }) => {
+    log.info(`Processing business detail: ${request.url}`);
+    await page.waitForTimeout(2000);
 
     const name = await page.$eval('h1', el => el.innerText.trim()).catch(() => 'Unknown');
-    const website = await page.evaluate(() => {
+    let website = await page.evaluate(() => {
         const el = document.querySelector('a[data-item-id="authority"]') 
                 || document.querySelector('a[aria-label*="website"]')
                 || document.querySelector('a[aria-label*="Web sitesi"]')
@@ -69,21 +93,30 @@ router.addHandler('BUSINESS_DETAIL', async ({ page, request, enqueueLinks }) => 
         return el ? el.href : null;
     });
 
-    crawleeLog.info(`Business: ${name}, Website: ${website || 'N/A'}`);
+    // CRITICAL: Clean Google redirect URLs
+    website = cleanWebsiteUrl(website);
 
-    if (website && !['google.com', 'gstatic.com', 'facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com'].some(d => website.includes(d))) {
-        crawleeLog.info(`Enqueuing website for email extraction: ${website}`);
-        // Use requestQueue directly for more reliability in handler transitions
-        await requestQueue.addRequest({
-            url: website,
-            label: 'EXTRACT_EMAILS',
-            userData: { businessName: name, website: website, pagesCrawled: 0 },
-            // Unique key to prevent duplicate processing of the same website
-            uniqueKey: website.replace('www.', '').split(/[?#]/)[0]
-        });
+    log.info(`Business: ${name}, Website: ${website || 'N/A'}`);
+
+    if (website) {
+        const urlObj = new URL(website);
+        const domain = urlObj.hostname.toLowerCase();
+        const blacklisted = ['google.com', 'gstatic.com', 'facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com'];
+        
+        if (!blacklisted.some(b => domain.includes(b))) {
+            log.info(`Enqueuing website for email extraction: ${website}`);
+            await requestQueue.addRequest({
+                url: website,
+                label: 'EXTRACT_EMAILS',
+                userData: { businessName: name, website, pagesCrawled: 0 },
+                uniqueKey: website.replace('www.', '').split(/[?#]/)[0]
+            });
+        } else {
+             log.warning(`Skipping social media or google domain for ${name}: ${website}`);
+             await Dataset.pushData({ businessName: name, website, emails: [], status: 'skipped (social/google domain)' });
+        }
     } else {
-        crawleeLog.info(`Skipping website for ${name}: ${website || 'None'}`);
-        await Dataset.pushData({ businessName: name, website, emails: [], status: website ? 'skipped domain' : 'no website' });
+        await Dataset.pushData({ businessName: name, website: null, emails: [], status: 'no website found' });
     }
 });
 
@@ -96,13 +129,14 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, log, enqueueLinks })
         els.map(el => el.href.replace('mailto:', '').split('?')[0].trim())
     );
     
-    const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!jpeg|jpg|png|gif|webp|svg|ico|css|js|woff2?|ttf|svg)[a-zA-Z]{2,}/g) || [];
+    // Better regex
+    const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@(?![0-9.])[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
     
     const allEmails = [...new Set([...mailtoEmails, ...pageEmails].map(e => e.toLowerCase()))]
-        .filter(e => e.includes('@') && e.includes('.') && !e.match(/\.(png|jpg|jpeg|gif|svg|webp)$/i));
+        .filter(e => e.includes('@') && e.includes('.') && !e.match(/\.(png|jpg|jpeg|gif|svg|webp|woff|ttf)$/i));
 
     if (allEmails.length > 0) {
-        log.info(`Found ${allEmails.length} emails for ${businessName}: ${allEmails[0]}...`);
+        log.info(`Found ${allEmails.length} emails for ${businessName}`);
         await Dataset.pushData({ 
             businessName, 
             website, 
@@ -111,7 +145,7 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, log, enqueueLinks })
             foundOn: request.url
         });
     } else if (pagesCrawled < maxWebsitePages) {
-        log.info(`No emails found on ${request.url}, looking for more pages...`);
+        log.info(`No emails on ${request.url}, looking for more pages...`);
         await enqueueLinks({
             limit: 5,
             selector: 'a',
@@ -123,31 +157,24 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, log, enqueueLinks })
                     const b = new URL(website);
                     if (u.hostname.replace('www.', '') !== b.hostname.replace('www.', '')) return false;
                     if (/\.(pdf|zip|jpg|png|jpeg|docx?|xlsx?|woff2?|ttf|svg|css|js)$/i.test(u.pathname)) return false;
-                    
-                    // Prioritize contact/about pages specially in the first level
-                    const p = u.pathname.toLowerCase();
-                    const words = ['contact', 'iletisim', 'about', 'hakkimizda', 'bize-ulasin', 'contact-us', 'iletisim-bilgileri'];
-                    if (pagesCrawled === 0 && !words.some(w => p.includes(w)) && !p.endsWith('/') && p.length > 1) {
-                        // We still allow it but the limit 5 handles the growth
-                    }
                     return req;
                 } catch(e) {}
                 return false;
             }
         });
     } else {
-        await Dataset.pushData({ businessName, website, emails: [], status: 'no emails found' });
+        // Just log depth reached
+        log.info(`Final depth reached for ${businessName} website.`);
     }
 });
 
 const crawler = new PlaywrightCrawler({
     requestHandler: router,
     maxConcurrency,
-    requestHandlerTimeoutSecs: 60,
+    requestHandlerTimeoutSecs: 90,
     launchContext: {
         launchOptions: {
             headless: true,
-            // Add flags to reduce memory footprint
             args: [
                 '--disable-dev-shm-usage',
                 '--disable-setuid-sandbox',
@@ -156,14 +183,12 @@ const crawler = new PlaywrightCrawler({
             ],
         },
     },
-    // Simplified browser pool options to avoid validation errors
     browserPoolOptions: {
         useFingerprints: true,
     },
     preNavigationHooks: [
         async ({ blockRequests }) => {
             await blockRequests({
-                // Block more aggressively
                 urlPatterns: [
                     '.jpg', '.jpeg', '.png', '.svg', '.gif', '.css', '.woff', '.pdf', 
                     '.zip', 'google-analytics.com', 'facebook.net', 'googletagmanager.com'
