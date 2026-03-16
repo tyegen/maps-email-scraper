@@ -70,14 +70,33 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                 }
             }
             
-            // Extract Rating & Reviews using robust text matching instead of checking aria-label translations
+            // Extract Rating & Reviews robustly
             let totalScore = null;
             let reviewsCount = null;
-            const textContent = article.innerText || '';
-            const ratingMatch = textContent.match(/(\d[.,]\d)\s*\(([\d,.]+)\)/);
-            if (ratingMatch) {
-                totalScore = parseFloat(ratingMatch[1].replace(',', '.'));
-                reviewsCount = parseInt(ratingMatch[2].replace(/[^\d]/g, ''), 10);
+            
+            // Try explicit aria-label search first
+            const imgSpans = Array.from(article.querySelectorAll('span[role="img"]'));
+            for (const span of imgSpans) {
+                const aria = span.getAttribute('aria-label') || '';
+                // e.g. "4.8 stars 123 Reviews" or "4,8 yıldız 1.234 Yorum"
+                if (aria.toLowerCase().includes('star') || aria.toLowerCase().includes('yıldız') || aria.toLowerCase().includes('review') || aria.toLowerCase().includes('yorum')) {
+                    const match = aria.match(/[\d,.]+/g);
+                    if (match && match.length >= 2) {
+                        totalScore = parseFloat(match[0].replace(',', '.'));
+                        reviewsCount = parseInt(match[1].replace(/[^\d]/g, ''), 10);
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: look at the inner text of the entire article for a pattern like "4.5(123)"
+            if (totalScore === null) {
+                const textContent = article.innerText || '';
+                const match = textContent.match(/(\d[.,]\d)\s*\(([\d.,]+)\)/);
+                if (match) {
+                    totalScore = parseFloat(match[1].replace(',', '.'));
+                    reviewsCount = parseInt(match[2].replace(/[^\d]/g, ''), 10);
+                }
             }
 
             // Extract Address safely, ignoring opening hours
