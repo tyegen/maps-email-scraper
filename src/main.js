@@ -1,19 +1,17 @@
 import { Actor } from 'apify';
-import { PlaywrightCrawler, Dataset, createPlaywrightRouter, log } from 'crawlee';
+import { PlaywrightCrawler, CheerioCrawler, Dataset, createPlaywrightRouter, createCheerioRouter, log } from 'crawlee';
 
 await Actor.init();
 
 const { 
     searchQueries, 
     maxResultsPerQuery = 10, 
-    maxWebsitePages = 2, // Keep it low for speed
+    maxWebsitePages = 2,
     maxConcurrency = 10 
 } = await Actor.getInput();
 
-const router = createPlaywrightRouter();
-const requestQueue = await Actor.openRequestQueue();
-
-// Track processed businesses to avoid duplicate entries in final dataset
+const playwrightRouter = createPlaywrightRouter();
+const cheerioRouter = createCheerioRouter();
 const resultsMap = new Map();
 
 function cleanWebsiteUrl(url) {
@@ -28,16 +26,12 @@ function cleanWebsiteUrl(url) {
     return url;
 }
 
-router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
+playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
     log.info(`Searching: ${request.userData.query}`);
-    
-    // Quick handle cookie consent
     const cookieButton = await page.$('button[aria-label*="Accept"], button[aria-label*="Kabul"], button[id*="L2AGLb"]');
     if (cookieButton) await cookieButton.click();
 
     await page.waitForSelector('div[role="feed"]', { timeout: 15000 }).catch(() => {});
-    
-    // Fast efficient scroll
     await page.evaluate(async (max) => {
         const feed = document.querySelector('div[role="feed"]');
         if (!feed) return;
@@ -70,11 +64,9 @@ router.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks }) => {
     }
 });
 
-router.addHandler('BUSINESS_DETAIL', async ({ page, request, log }) => {
-    // No long wait here, just wait for H1
+playwrightRouter.addHandler('BUSINESS_DETAIL', async ({ page, log }) => {
     await page.waitForSelector('h1', { timeout: 10000 }).catch(() => {});
     const name = await page.$eval('h1', el => el.innerText.trim()).catch(() => 'Unknown');
-    
     let website = await page.evaluate(() => {
         const el = document.querySelector('a[data-item-id="authority"]') 
                 || document.querySelector('a[aria-label*="website"]')
@@ -87,130 +79,111 @@ router.addHandler('BUSINESS_DETAIL', async ({ page, request, log }) => {
     website = cleanWebsiteUrl(website);
     log.info(`Business Found: ${name}`);
 
-    // Standardize name for Map key to avoid casing duplicates
     const mapKey = name.toLowerCase().trim();
     if (!resultsMap.has(mapKey)) {
         resultsMap.set(mapKey, { businessName: name, website, emails: new Set(), status: 'processing' });
     } else {
-        log.info(`Business ${name} already in results, skipping.`);
         return;
     }
 
     if (website && !['facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com', 'tiktok.com'].some(d => website.includes(d))) {
-        await requestQueue.addRequest({
-            url: website,
-            label: 'EXTRACT_EMAILS',
-            userData: { businessName: name, website, pagesCrawled: 0 },
-        });
+        // We will pass this to the Cheerio crawler later
     } else {
         resultsMap.get(mapKey).status = website ? 'skipped (social/google)' : 'no website';
     }
 });
 
-router.addHandler('EXTRACT_EMAILS', async ({ page, request, log, enqueueLinks }) => {
+// CHEERIO HANDLER (Lightning fast)
+cheerioRouter.addHandler('EXTRACT_EMAILS', async ({ $, request, log, enqueueLinks }) => {
     const { businessName, website, pagesCrawled } = request.userData;
     const mapKey = businessName.toLowerCase().trim();
     const res = resultsMap.get(mapKey);
 
-    // If we already have emails and want to be FAST, we could stop here. 
-    // But let's at least finish the current page.
-    
-    const html = await page.content();
-    const mailto = await page.$$eval('a[href^="mailto:"]', (els) => els.map(el => el.href.replace('mailto:', '').split('?')[0].trim()));
+    const html = $.html();
+    const mailto = $('a[href^="mailto:"]').map((i, el) => $(el).attr('href').replace('mailto:', '').split('?')[0].trim()).get();
     const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
     
     if (res) {
         [...mailto, ...pageEmails].forEach(e => {
             const clean = e.toLowerCase().trim();
-            // Filter out common junk and duplicates handled by Set
             if (clean.includes('@') && clean.includes('.') && !clean.match(/\.(png|jpg|jpeg|gif|svg|webp|woff|ttf|css|js|ico)$/)) {
                 res.emails.add(clean);
             }
         });
     }
 
-    // Speed optimization: If emails found on homepage, DON'T crawl subpages unless depth is forced
-    const foundAny = res && res.emails.size > 0;
-    
-    if (!foundAny && pagesCrawled < maxWebsitePages) {
+    if (!(res && res.emails.size > 0) && pagesCrawled < maxWebsitePages) {
         await enqueueLinks({
             limit: 3,
-            selector: 'a',
             label: 'EXTRACT_EMAILS',
             userData: { ...request.userData, pagesCrawled: pagesCrawled + 1 },
             transformRequestFunction: (req) => {
-                try {
-                    const u = new URL(req.url);
-                    const b = new URL(website);
-                    if (u.hostname.replace('www.', '') !== b.hostname.replace('www.', '')) return false;
-                    // Aggressive filter
-                    if (/\.(pdf|zip|jpg|png|jpeg|docx?|xlsx?|woff2?|ttf|svg|css|js|mp4|mp3|wav)$/i.test(u.pathname)) return false;
-                    // Ignore login/cart/etc.
-                    if (['login', 'cart', 'checkout', 'account', 'register'].some(w => u.pathname.toLowerCase().includes(w))) return false;
-                    return req;
-                } catch(e) {}
-                return false;
+                const u = new URL(req.url);
+                const b = new URL(website);
+                if (u.hostname.replace('www.', '') !== b.hostname.replace('www.', '')) return false;
+                if (/\.(pdf|zip|jpg|png|jpeg|docx?|xlsx?|woff2?|ttf|svg|css|js|mp4|mp3|wav)$/i.test(u.pathname)) return false;
+                if (['login', 'cart', 'checkout', 'account', 'register'].some(w => u.pathname.toLowerCase().includes(w))) return false;
+                return req;
             }
         });
     }
-    
+
     if (res) {
         if (res.emails.size > 0) res.status = 'success';
         else if (res.status === 'processing') res.status = 'no emails found';
     }
 });
 
-const crawler = new PlaywrightCrawler({
-    requestHandler: router,
-    maxConcurrency,
-    // Lower timeouts for speed
-    requestHandlerTimeoutSecs: 45,
-    navigationTimeoutSecs: 30,
+// RUNNERS
+log.info('Phase 1: Capturing businesses with Playwright...');
+const playwrightCrawler = new PlaywrightCrawler({
+    requestHandler: playwrightRouter,
+    maxConcurrency: 2, // Maps is heavy, keep it low to save CPU for later
     launchContext: {
         launchOptions: {
             headless: true,
-            args: [
-                '--disable-dev-shm-usage', 
-                '--no-sandbox', 
-                '--disable-gpu', 
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--blink-settings=imagesEnabled=false', // Hard block images in browser engine
-            ],
+            args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--blink-settings=imagesEnabled=false'],
         },
     },
-    browserPoolOptions: { 
-        useFingerprints: true,
-        // Kill browsers faster to free CPU
-        operationTimeoutSecs: 30,
-    },
-    preNavigationHooks: [
-        async ({ blockRequests }) => {
-            await blockRequests({
-                urlPatterns: ['.jpg', '.jpeg', '.png', '.svg', '.gif', '.css', '.woff', '.pdf', '.zip', 'analytics', 'facebook', 'google-analytics'],
-            });
-        },
-    ],
 });
 
-log.info('Starting...');
-await crawler.run(searchQueries.map(q => ({
+await playwrightCrawler.run(searchQueries.map(q => ({
     url: `https://www.google.com/maps/search/${encodeURIComponent(q)}`,
     label: 'MAPS_SEARCH',
     userData: { query: q }
 })));
 
-// Push aggregated results to dataset
+log.info('Phase 2: Extracting emails with Cheerio (Fast Mode)...');
+const websiteRequests = [];
+for (const [key, data] of resultsMap.entries()) {
+    if (data.website && data.status === 'processing') {
+        websiteRequests.push({
+            url: data.website,
+            label: 'EXTRACT_EMAILS',
+            userData: { businessName: data.businessName, website: data.website, pagesCrawled: 0 }
+        });
+    }
+}
+
+if (websiteRequests.length > 0) {
+    const cheerioCrawler = new CheerioCrawler({
+        requestHandler: cheerioRouter,
+        maxConcurrency: 20, // Cheerio is very light, high concurrency is fine
+    });
+    await cheerioCrawler.run(websiteRequests);
+}
+
 log.info('Finalizing results...');
 const finalResults = [];
 for (const [name, data] of resultsMap.entries()) {
     finalResults.push({
-        businessName: name,
+        businessName: data.businessName,
         website: data.website,
         emails: [...data.emails],
         status: data.emails.size > 0 ? 'success' : data.status
     });
 }
 await Dataset.pushData(finalResults);
-log.info(`Done. Pushed ${finalResults.length} unique businesses.`);
+log.info(`Done. Pushed ${finalResults.length} businesses.`);
 
 await Actor.exit();
