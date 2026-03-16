@@ -70,17 +70,14 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                 }
             }
             
-            // Extract Rating & Reviews
+            // Extract Rating & Reviews using robust text matching instead of checking aria-label translations
             let totalScore = null;
             let reviewsCount = null;
-            const scoreEl = article.querySelector('span[role="img"][aria-label*="star"], span[role="img"][aria-label*="yıldız"]');
-            if (scoreEl) {
-                const aria = scoreEl.getAttribute('aria-label');
-                const match = aria.match(/[\d,.]+/g);
-                if (match && match.length >= 2) {
-                    totalScore = parseFloat(match[0].replace(',', '.'));
-                    reviewsCount = parseInt(match[1].replace(/\D/g, ''), 10);
-                }
+            const textContent = article.innerText || '';
+            const ratingMatch = textContent.match(/(\d[.,]\d)\s*\(([\d,.]+)\)/);
+            if (ratingMatch) {
+                totalScore = parseFloat(ratingMatch[1].replace(',', '.'));
+                reviewsCount = parseInt(ratingMatch[2].replace(/[^\d]/g, ''), 10);
             }
 
             // Extract Address safely, ignoring opening hours
@@ -323,11 +320,8 @@ for (const [name, data] of resultsMap.entries()) {
         "place name": data.businessName,
         "total score": data.totalScore || null,
         "reviews count": data.reviewsCount || null,
-        "street": data.address || null, // Best effort from feed or deep extract
-        "city": data.city || null,
-        "country": data.country || null,
-        "website": data.website,
-        "tel no": data.phone || null
+        "street": data.address || null,
+        "website": data.website
     };
 
     if (extractContacts) {
