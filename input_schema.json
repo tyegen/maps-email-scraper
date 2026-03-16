@@ -27,8 +27,8 @@
         "maxConcurrency": {
             "title": "Max Concurrency",
             "type": "integer",
-            "description": "Maximum number of parallel browser tabs.",
-            "default": 5,
+            "description": "Maximum number of parallel browser tabs. Recommended: 2-3 for 1GB RAM, 5-10 for 2GB+.",
+            "default": 2,
             "minimum": 1
         }
     },

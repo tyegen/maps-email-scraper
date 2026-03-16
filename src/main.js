@@ -7,7 +7,7 @@ const {
     searchQueries, 
     maxResultsPerQuery = 10, 
     maxWebsitePages = 2,
-    maxConcurrency = 5 
+    maxConcurrency = 2 // Lowered default to prevent OOM on 1GB
 } = await Actor.getInput();
 
 const router = createPlaywrightRouter();
@@ -143,18 +143,31 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, log, enqueueLinks })
 const crawler = new PlaywrightCrawler({
     requestHandler: router,
     maxConcurrency,
-    // Increase timeout for Istanbul's large results if needed
     requestHandlerTimeoutSecs: 60,
     launchContext: {
         launchOptions: {
             headless: true,
+            // Add flags to reduce memory footprint
+            args: [
+                '--disable-dev-shm-usage',
+                '--disable-setuid-sandbox',
+                '--no-sandbox',
+                '--disable-gpu',
+            ],
         },
     },
-    // Speed up by blocking non-essential assets
+    // Recycle browser instances more frequently to free memory
+    browserPoolOptions: {
+        maxRequestsPerBrowser: 10,
+    },
     preNavigationHooks: [
         async ({ blockRequests }) => {
             await blockRequests({
-                urlPatterns: ['.jpg', '.jpeg', '.png', '.svg', '.gif', '.css', '.woff', '.pdf', '.zip'],
+                // Block more aggressively
+                urlPatterns: [
+                    '.jpg', '.jpeg', '.png', '.svg', '.gif', '.css', '.woff', '.pdf', 
+                    '.zip', 'google-analytics.com', 'facebook.net', 'googletagmanager.com'
+                ],
             });
         },
     ],
