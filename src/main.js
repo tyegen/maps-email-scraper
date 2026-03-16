@@ -156,9 +156,9 @@ const crawler = new PlaywrightCrawler({
             ],
         },
     },
-    // Recycle browser instances more frequently to free memory
+    // Simplified browser pool options to avoid validation errors
     browserPoolOptions: {
-        maxRequestsPerBrowser: 10,
+        useFingerprints: true,
     },
     preNavigationHooks: [
         async ({ blockRequests }) => {
