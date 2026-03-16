@@ -7,7 +7,10 @@ const {
     searchQueries, 
     maxResultsPerQuery = 10, 
     maxWebsitePages = 2,
-    maxConcurrency = 10 
+    maxConcurrency = 10,
+    extractPlaceDetails = false,
+    extractContacts = false,
+    extractSocialMedia = false
 } = await Actor.getInput();
 
 const playwrightRouter = createPlaywrightRouter();
@@ -48,62 +51,126 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
         }
     }, maxResultsPerQuery);
 
-    const links = await page.$$eval('div[role="article"] a', (els) => {
-        return els.filter(el => el.href && el.href.includes('/maps/place/')).map(el => el.href);
+    const items = await page.$$eval('div[role="article"]', (articles) => {
+        return articles.map(article => {
+            const linkEl = article.querySelector('a[href*="/maps/place/"]');
+            if (!linkEl) return null;
+            
+            const mapsUrl = linkEl.href;
+            const businessName = linkEl.getAttribute('aria-label') || 'Unknown';
+            
+            // Try to find website button in the feed card
+            let website = null;
+            const webEls = article.querySelectorAll('a');
+            for (const a of webEls) {
+                if (a.href && !a.href.includes('google.com') && !a.href.includes('/maps/') && (a.innerText.toLowerCase().includes('site') || a.innerText.toLowerCase().includes('web') || a.getAttribute('data-value')?.toLowerCase().includes('web'))) {
+                    website = a.href;
+                    break;
+                }
+            }
+            
+            return { mapsUrl, businessName, website };
+        }).filter(item => item !== null);
     });
 
-    const uniqueLinks = [...new Set(links)].slice(0, maxResultsPerQuery);
-    log.info(`Found ${uniqueLinks.length} businesses.`);
+    // Deduplicate from feed
+    const uniqueItems = [];
+    const seen = new Set();
+    for (const item of items) {
+        if (!seen.has(item.mapsUrl)) {
+            seen.add(item.mapsUrl);
+            uniqueItems.push(item);
+        }
+    }
+    const limitedItems = uniqueItems.slice(0, maxResultsPerQuery);
+    
+    log.info(`Found ${limitedItems.length} businesses.`);
 
-    for (const url of uniqueLinks) {
-        await enqueueLinks({
-            urls: [url],
-            label: 'BUSINESS_DETAIL',
-            userData: { query: request.userData.query }
-        });
+    for (const item of limitedItems) {
+        const mapKey = item.businessName.toLowerCase().trim();
+        if (!resultsMap.has(mapKey)) {
+            resultsMap.set(mapKey, { 
+                businessName: item.businessName, 
+                mapsUrl: item.mapsUrl,
+                website: cleanWebsiteUrl(item.website), 
+                emails: new Set(),
+                socials: {},
+                status: 'feed_extracted' 
+            });
+        }
+        
+        if (extractPlaceDetails) {
+            await enqueueLinks({
+                urls: [item.mapsUrl],
+                label: 'BUSINESS_DETAIL',
+                userData: { query: request.userData.query, mapKey, businessName: item.businessName }
+            });
+        }
     }
 });
 
-playwrightRouter.addHandler('BUSINESS_DETAIL', async ({ page, log }) => {
+playwrightRouter.addHandler('BUSINESS_DETAIL', async ({ page, request, log }) => {
+    const { mapKey, businessName } = request.userData;
+    
     await page.waitForSelector('h1', { timeout: 10000 }).catch(() => {});
-    const name = await page.$eval('h1', el => el.innerText.trim()).catch(() => 'Unknown');
+    
+    // Extract deep details
+    const details = await page.evaluate(() => {
+        const d = { 
+            category: null, address: null, phone: null, 
+            totalScore: null, reviewsCount: null, price: null 
+        };
+        
+        const catEl = document.querySelector('button[jsaction*="category"]');
+        if (catEl) d.category = catEl.innerText.trim();
+        
+        const addrEl = document.querySelector('button[data-item-id="address"]');
+        if (addrEl) d.address = addrEl.innerText.trim();
+        
+        const phoneEl = document.querySelector('button[data-item-id^="phone:"]');
+        if (phoneEl) d.phone = phoneEl.innerText.trim();
+        
+        const scoreEl = document.querySelector('div[role="img"][aria-label*="stars"]');
+        if (scoreEl) {
+            const match = scoreEl.getAttribute('aria-label').match(/[\d,.]+/g);
+            if (match && match.length >= 2) {
+                d.totalScore = parseFloat(match[0].replace(',', '.'));
+                d.reviewsCount = parseInt(match[1].replace(/\D/g, ''), 10);
+            }
+        }
+        
+        return d;
+    });
+
+    // Check if we didn't find website in feed, try to find it here
     let website = await page.evaluate(() => {
-        const el = document.querySelector('a[data-item-id="authority"]') 
-                || document.querySelector('a[aria-label*="website"]')
-                || document.querySelector('a[aria-label*="Web sitesi"]')
-                || document.querySelector('a[aria-label*="web sitesi"]')
-                || Array.from(document.querySelectorAll('a')).find(a => a.href && !a.href.includes('google.com') && (a.innerText.toLowerCase().includes('site') || a.innerText.toLowerCase().includes('web')));
+        const el = document.querySelector('a[data-item-id="authority"]') || document.querySelector('a[aria-label*="website"]');
         return el ? el.href : null;
     });
 
-    website = cleanWebsiteUrl(website);
-    log.info(`Business Found: ${name}`);
+    log.info(`Extracted Details for: ${businessName}`);
 
-    const mapKey = name.toLowerCase().trim();
-    if (!resultsMap.has(mapKey)) {
-        resultsMap.set(mapKey, { businessName: name, website, emails: new Set(), status: 'processing' });
-    } else {
-        return;
-    }
-
-    if (website && !['facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com', 'tiktok.com'].some(d => website.includes(d))) {
-        // We will pass this to the Cheerio crawler later
-    } else {
-        resultsMap.get(mapKey).status = website ? 'skipped (social/google)' : 'no website';
+    const res = resultsMap.get(mapKey);
+    if (res) {
+        Object.assign(res, details);
+        if (!res.website && website) {
+            res.website = cleanWebsiteUrl(website);
+        }
+        res.status = 'details_extracted';
     }
 });
 
-// CHEERIO HANDLER (Lightning fast)
+// CHEERIO HANDLER (Lightning fast, for Contacts & Social Media)
 cheerioRouter.addHandler('EXTRACT_EMAILS', async ({ $, request, log, enqueueLinks }) => {
     const { businessName, website, pagesCrawled } = request.userData;
     const mapKey = businessName.toLowerCase().trim();
     const res = resultsMap.get(mapKey);
 
     const html = $.html();
-    const mailto = $('a[href^="mailto:"]').map((i, el) => $(el).attr('href').replace('mailto:', '').split('?')[0].trim()).get();
-    const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
     
-    if (res) {
+    if (res && extractContacts) {
+        const mailto = $('a[href^="mailto:"]').map((i, el) => $(el).attr('href').replace('mailto:', '').split('?')[0].trim()).get();
+        const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
         [...mailto, ...pageEmails].forEach(e => {
             const clean = e.toLowerCase().trim();
             if (clean.includes('@') && clean.includes('.') && !clean.match(/\.(png|jpg|jpeg|gif|svg|webp|woff|ttf|css|js|ico)$/)) {
@@ -112,7 +179,22 @@ cheerioRouter.addHandler('EXTRACT_EMAILS', async ({ $, request, log, enqueueLink
         });
     }
 
-    if (!(res && res.emails.size > 0) && pagesCrawled < maxWebsitePages) {
+    if (res && extractSocialMedia) {
+        const socialLinks = $('a').map((i, el) => $(el).attr('href')).get().filter(h => h && h.startsWith('http'));
+        const platforms = ['facebook', 'instagram', 'twitter', 'linkedin', 'youtube', 'tiktok', 'pinterest'];
+        
+        for (const link of socialLinks) {
+            for (const platform of platforms) {
+                if (link.toLowerCase().includes(`${platform}.com`)) {
+                    if (!res.socials[platform]) res.socials[platform] = new Set();
+                    res.socials[platform].add(link);
+                }
+            }
+        }
+    }
+
+    // Crawl deeper if needed
+    if (!(res && res.emails.size > 0 && res.socials && Object.keys(res.socials).length > 0) && pagesCrawled < maxWebsitePages) {
         await enqueueLinks({
             limit: 3,
             label: 'EXTRACT_EMAILS',
@@ -129,8 +211,7 @@ cheerioRouter.addHandler('EXTRACT_EMAILS', async ({ $, request, log, enqueueLink
     }
 
     if (res) {
-        if (res.emails.size > 0) res.status = 'success';
-        else if (res.status === 'processing') res.status = 'no emails found';
+        res.status = 'enriched';
     }
 });
 
@@ -153,35 +234,58 @@ await playwrightCrawler.run(searchQueries.map(q => ({
     userData: { query: q }
 })));
 
-log.info('Phase 2: Extracting emails with Cheerio (Fast Mode)...');
-const websiteRequests = [];
-for (const [key, data] of resultsMap.entries()) {
-    if (data.website && data.status === 'processing') {
-        websiteRequests.push({
-            url: data.website,
-            label: 'EXTRACT_EMAILS',
-            userData: { businessName: data.businessName, website: data.website, pagesCrawled: 0 }
-        });
+if (extractContacts || extractSocialMedia) {
+    log.info('Phase 2: Extracting Contacts & Socials with Cheerio (Fast Mode)...');
+    const websiteRequests = [];
+    for (const [key, data] of resultsMap.entries()) {
+        if (data.website && !['facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com', 'tiktok.com'].some(d => data.website.includes(d))) {
+            websiteRequests.push({
+                url: data.website,
+                label: 'EXTRACT_EMAILS',
+                userData: { businessName: data.businessName, website: data.website, pagesCrawled: 0 }
+            });
+        }
     }
-}
 
-if (websiteRequests.length > 0) {
-    const cheerioCrawler = new CheerioCrawler({
-        requestHandler: cheerioRouter,
-        maxConcurrency: 20, // Cheerio is very light, high concurrency is fine
-    });
-    await cheerioCrawler.run(websiteRequests);
+    if (websiteRequests.length > 0) {
+        const cheerioCrawler = new CheerioCrawler({
+            requestHandler: cheerioRouter,
+            maxConcurrency: 20, // Cheerio is very light, high concurrency is fine
+        });
+        await cheerioCrawler.run(websiteRequests);
+    }
+} else {
+    log.info('Phase 2 skipped (extractContacts & extractSocialMedia are false).');
 }
 
 log.info('Finalizing results...');
 const finalResults = [];
 for (const [name, data] of resultsMap.entries()) {
-    finalResults.push({
-        businessName: data.businessName,
+    const finalData = {
+        title: data.businessName,
+        mapsUrl: data.mapsUrl,
         website: data.website,
-        emails: [...data.emails],
-        status: data.emails.size > 0 ? 'success' : data.status
-    });
+        categoryName: data.category || null,
+        address: data.address || null,
+        phoneUnformatted: data.phone || null,
+        totalScore: data.totalScore || null,
+        reviewsCount: data.reviewsCount || null,
+    };
+
+    if (extractContacts) {
+        finalData.emails = [...data.emails];
+    }
+    
+    if (extractSocialMedia) {
+        // Convert Sets in socials to arrays
+        const socialsArrays = {};
+        for (const [plat, links] of Object.entries(data.socials)) {
+            socialsArrays[`${plat}s`] = [...links];
+        }
+        Object.assign(finalData, socialsArrays);
+    }
+
+    finalResults.push(finalData);
 }
 await Dataset.pushData(finalResults);
 log.info(`Done. Pushed ${finalResults.length} businesses.`);

@@ -27,9 +27,27 @@
         "maxConcurrency": {
             "title": "Max Concurrency",
             "type": "integer",
-            "description": "Maximum number of parallel browser tabs. Recommended: 2-3 for 1GB RAM, 5-10 for 2GB+.",
-            "default": 5,
+            "description": "Maximum number of parallel browser tabs. Recommended: 5-10 for 2GB+.",
+            "default": 10,
             "minimum": 1
+        },
+        "extractPlaceDetails": {
+            "title": "Add-on: Extract Place Details",
+            "type": "boolean",
+            "description": "If enabled, visits each business page to extract address, phone, ratings, reviews count, and opening hours. (Slower)",
+            "default": false
+        },
+        "extractContacts": {
+            "title": "Add-on: Company Contacts Enrichment",
+            "type": "boolean",
+            "description": "If enabled, visits the business website (if found) to extract emails. (Fast)",
+            "default": false
+        },
+        "extractSocialMedia": {
+            "title": "Add-on: Social Media Enrichment",
+            "type": "boolean",
+            "description": "If enabled, extracts social media links (Facebook, Instagram, LinkedIn, YouTube, TikTok, Twitter) from the business website. Requires Contacts Enrichment to be enabled.",
+            "default": false
         }
     },
     "required": ["searchQueries"]
