@@ -78,24 +78,28 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
             const imgSpans = Array.from(article.querySelectorAll('span[role="img"]'));
             for (const span of imgSpans) {
                 const aria = span.getAttribute('aria-label') || '';
-                // e.g. "4.8 stars 123 Reviews" or "4,8 yıldız 1.234 Yorum"
+                // e.g. "4.8 stars" or "4,8 yıldızlı"
                 if (aria.toLowerCase().includes('star') || aria.toLowerCase().includes('yıldız') || aria.toLowerCase().includes('review') || aria.toLowerCase().includes('yorum')) {
                     const match = aria.match(/[\d,.]+/g);
-                    if (match && match.length >= 2) {
+                    if (match && match.length > 0) {
                         totalScore = parseFloat(match[0].replace(',', '.'));
-                        reviewsCount = parseInt(match[1].replace(/[^\d]/g, ''), 10);
+                        if (match.length >= 2) {
+                            reviewsCount = parseInt(match[1].replace(/[^\d]/g, ''), 10);
+                        }
                         break;
                     }
                 }
             }
 
-            // Fallback: look at the inner text of the entire article for a pattern like "4.5(123)"
+            // Fallback: look at the inner text of the entire article for a number and optional review count in parens
             if (totalScore === null) {
                 const textContent = article.innerText || '';
-                const match = textContent.match(/(\d[.,]\d)\s*\(([\d.,]+)\)/);
+                const match = textContent.match(/(\d[.,]\d)(\s*\(([\d.,]+)\))?/);
                 if (match) {
                     totalScore = parseFloat(match[1].replace(',', '.'));
-                    reviewsCount = parseInt(match[2].replace(/[^\d]/g, ''), 10);
+                    if (match[3]) {
+                        reviewsCount = parseInt(match[3].replace(/[^\d]/g, ''), 10);
+                    }
                 }
             }
 
