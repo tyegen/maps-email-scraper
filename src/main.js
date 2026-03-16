@@ -85,6 +85,9 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
 
             // Extract Address from feed text
             let address = null;
+            let city = null;
+            let country = null;
+
             const textDivs = article.querySelectorAll('div > div');
             for (const div of textDivs) {
                 const text = div.innerText || '';
@@ -92,8 +95,13 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                     const parts = text.split('·').map(p => p.trim());
                     for (const p of parts) {
                         // If it's long enough, doesn't look like just a phone number, and isn't a price/review text
-                        if (p.length > 5 && !p.match(/^\+?[\d\s\-\(\)]+$/) && !p.includes('$') && !p.toLowerCase().includes('review') && !p.toLowerCase().includes('yorum')) {
+                        if (p.length > 5 && !p.match(/^\+?[\d\s\-\(\)]+$/) && !p.includes('$') && !p.toLowerCase().includes('review') && !p.toLowerCase().includes('yorum') && !p.includes('(')) {
                             address = p;
+                            // Attempt to parse Turkey/US format from feed: e.g. "Kadıköy/İstanbul", "New York, NY"
+                            const addrParts = p.split(/[,/]/).map(s => s.trim());
+                            if (addrParts.length > 1) {
+                                city = addrParts[addrParts.length - 1]; // very basic guess
+                            }
                         }
                     }
                 }
@@ -107,7 +115,7 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                 location.lng = parseFloat(coordsMatch[2]);
             }
 
-            return { mapsUrl, businessName, website, totalScore, reviewsCount, address, location };
+            return { mapsUrl, businessName, website, totalScore, reviewsCount, address, city, country, location };
         }).filter(item => item !== null);
     });
 
@@ -134,6 +142,8 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                 totalScore: item.totalScore,
                 reviewsCount: item.reviewsCount,
                 address: item.address,
+                city: item.city,
+                country: item.country,
                 location: item.location,
                 emails: new Set(),
                 socials: {},
