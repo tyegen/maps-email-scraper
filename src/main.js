@@ -390,8 +390,9 @@ if (mapMarkers.length > 0) {
     </body>
     </html>
     `;
-    // Save as key-value store item that user can preview
-    await Actor.setValue('results-map.html', mapHtml, { contentType: 'text/html' });
+    // Apify uses the 'OUTPUT' key to populate the Live View tab automatically.
+    // If we save html there, the user doesn't need to host anything.
+    await Actor.setValue('OUTPUT', mapHtml, { contentType: 'text/html' });
 }
 
 log.info(`Done. Pushed ${finalResults.length} businesses.`);
