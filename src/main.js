@@ -63,8 +63,8 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
             let website = null;
             const webEls = article.querySelectorAll('a');
             for (const a of webEls) {
-                // If the link goes somewhere else than Google Maps, it's the website
-                if (a.href && !a.href.includes('google.com') && !a.href.includes('/maps/')) {
+                // Explicitly check for website strings. Google sometimes uses google.com/url redirects here.
+                if (a.href && !a.href.includes('/maps/') && (a.innerText.toLowerCase().includes('site') || a.innerText.toLowerCase().includes('web') || a.getAttribute('data-value')?.toLowerCase().includes('website'))) {
                     website = a.href;
                     break;
                 }
@@ -83,7 +83,7 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
                 }
             }
 
-            // Extract Address from feed text
+            // Extract Address safely, ignoring opening hours
             let address = null;
             let city = null;
             let country = null;
@@ -91,18 +91,12 @@ playwrightRouter.addHandler('MAPS_SEARCH', async ({ page, request, enqueueLinks 
             const textDivs = article.querySelectorAll('div > div');
             for (const div of textDivs) {
                 const text = div.innerText || '';
-                if (text.includes('·')) {
+                // Look for lines with dots but explicitly avoid time strings
+                if (text.includes('·') && !text.match(/\d{1,2}:\d{2}/) && !text.toLowerCase().match(/(açık|kapalı|open|closed)/)) {
                     const parts = text.split('·').map(p => p.trim());
-                    for (const p of parts) {
-                        // If it's long enough, doesn't look like just a phone number, and isn't a price/review text
-                        if (p.length > 5 && !p.match(/^\+?[\d\s\-\(\)]+$/) && !p.includes('$') && !p.toLowerCase().includes('review') && !p.toLowerCase().includes('yorum') && !p.includes('(')) {
-                            address = p;
-                            // Attempt to parse Turkey/US format from feed: e.g. "Kadıköy/İstanbul", "New York, NY"
-                            const addrParts = p.split(/[,/]/).map(s => s.trim());
-                            if (addrParts.length > 1) {
-                                city = addrParts[addrParts.length - 1]; // very basic guess
-                            }
-                        }
+                    const lastPart = parts[parts.length - 1];
+                    if (lastPart && lastPart.length > 3 && !lastPart.includes('$') && !lastPart.toLowerCase().match(/(review|yorum)/)) {
+                        address = lastPart;
                     }
                 }
             }
