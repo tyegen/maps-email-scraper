@@ -62,7 +62,10 @@ router.addHandler('BUSINESS_DETAIL', async ({ page, request, enqueueLinks }) => 
 
     const name = await page.$eval('h1', el => el.innerText.trim()).catch(() => 'Unknown');
     const website = await page.evaluate(() => {
-        const el = document.querySelector('a[data-item-id="authority"]') || document.querySelector('a[aria-label*="website"]');
+        const el = document.querySelector('a[data-item-id="authority"]') 
+                || document.querySelector('a[aria-label*="website"]')
+                || document.querySelector('a[aria-label*="Web sitesi"]')
+                || document.querySelector('a[aria-label*="web sitesi"]');
         return el ? el.href : null;
     });
 
@@ -84,25 +87,33 @@ router.addHandler('BUSINESS_DETAIL', async ({ page, request, enqueueLinks }) => 
     }
 });
 
-router.addHandler('EXTRACT_EMAILS', async ({ page, request, enqueueLinks }) => {
+router.addHandler('EXTRACT_EMAILS', async ({ page, request, log, enqueueLinks }) => {
     const { businessName, website, pagesCrawled } = request.userData;
-    crawleeLog.info(`Crawling website: ${request.url} (Deep: ${pagesCrawled})`);
+    log.info(`Crawling website: ${request.url} (Depth: ${pagesCrawled})`);
 
     const html = await page.content();
-    const emails = [...new Set(html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!jpeg|jpg|png|gif|webp|svg|ico|css|js|woff2?|ttf)[a-zA-Z]{2,}/g) || [])];
+    const mailtoEmails = await page.$$eval('a[href^="mailto:"]', (els) => 
+        els.map(el => el.href.replace('mailto:', '').split('?')[0].trim())
+    );
+    
+    const pageEmails = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!jpeg|jpg|png|gif|webp|svg|ico|css|js|woff2?|ttf|svg)[a-zA-Z]{2,}/g) || [];
+    
+    const allEmails = [...new Set([...mailtoEmails, ...pageEmails].map(e => e.toLowerCase()))]
+        .filter(e => e.includes('@') && e.includes('.') && !e.match(/\.(png|jpg|jpeg|gif|svg|webp)$/i));
 
-    if (emails.length > 0) {
-        crawleeLog.info(`Found ${emails.length} emails for ${businessName}`);
+    if (allEmails.length > 0) {
+        log.info(`Found ${allEmails.length} emails for ${businessName}: ${allEmails[0]}...`);
         await Dataset.pushData({ 
             businessName, 
             website, 
-            emails: emails.map(e => e.toLowerCase()), 
+            emails: allEmails, 
             status: 'success',
             foundOn: request.url
         });
     } else if (pagesCrawled < maxWebsitePages) {
+        log.info(`No emails found on ${request.url}, looking for more pages...`);
         await enqueueLinks({
-            limit: 3,
+            limit: 5,
             selector: 'a',
             label: 'EXTRACT_EMAILS',
             userData: { ...request.userData, pagesCrawled: pagesCrawled + 1 },
@@ -110,7 +121,16 @@ router.addHandler('EXTRACT_EMAILS', async ({ page, request, enqueueLinks }) => {
                 try {
                     const u = new URL(req.url);
                     const b = new URL(website);
-                    if (u.hostname.replace('www.', '') === b.hostname.replace('www.', '') && !/\.(pdf|zip|jpg|png|jpeg|docx?|xlsx?|woff2?|ttf|svg)$/i.test(u.pathname)) return req;
+                    if (u.hostname.replace('www.', '') !== b.hostname.replace('www.', '')) return false;
+                    if (/\.(pdf|zip|jpg|png|jpeg|docx?|xlsx?|woff2?|ttf|svg|css|js)$/i.test(u.pathname)) return false;
+                    
+                    // Prioritize contact/about pages specially in the first level
+                    const p = u.pathname.toLowerCase();
+                    const words = ['contact', 'iletisim', 'about', 'hakkimizda', 'bize-ulasin', 'contact-us', 'iletisim-bilgileri'];
+                    if (pagesCrawled === 0 && !words.some(w => p.includes(w)) && !p.endsWith('/') && p.length > 1) {
+                        // We still allow it but the limit 5 handles the growth
+                    }
+                    return req;
                 } catch(e) {}
                 return false;
             }
